@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+
 import sys
 import os
 from pathlib import Path
@@ -12,8 +13,8 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                             QStyle, QProgressBar, QDialog, QTreeWidget, 
                             QTreeWidgetItem, QMenu, QAction, QMessageBox,
                             QInputDialog, QComboBox)
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize
-from PyQt5.QtGui import QDragEnterEvent, QDropEvent, QIcon
+from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtGui import QDragEnterEvent, QDropEvent
 
 class VideoInfo:
     def __init__(self, path):
@@ -106,158 +107,6 @@ class DragDropList(QListWidget):
                 added = True
         if added:
             self.paths_changed.emit()
-
-class DuplicateManager(QDialog):
-    def __init__(self, duplicate_groups, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Duplicate Manager")
-        self.setMinimumSize(1000, 600)
-        self.duplicate_groups = duplicate_groups
-        self.selected_actions = {}  # group_index -> (action, selected_index)
-        
-        layout = QVBoxLayout(self)
-        
-        # Action selection
-        action_layout = QHBoxLayout()
-        self.action_combo = QComboBox()
-        self.action_combo.addItems([
-            "Keep largest resolution",
-            "Keep smallest file size",
-            "Keep newest file",
-            "Keep oldest file",
-            "Manual selection"
-        ])
-        action_layout.addWidget(QLabel("Default Action:"))
-        action_layout.addWidget(self.action_combo)
-        
-        # Apply to all button
-        self.apply_all_btn = QPushButton("Apply to All Groups")
-        self.apply_all_btn.clicked.connect(self.apply_to_all)
-        action_layout.addWidget(self.apply_all_btn)
-        action_layout.addStretch()
-        
-        layout.addLayout(action_layout)
-        
-        # Tree widget for duplicates
-        self.tree = QTreeWidget()
-        self.tree.setHeaderLabels(["File", "Size", "Resolution", "Duration", "Action"])
-        self.tree.setColumnWidth(0, 400)
-        self.tree.itemClicked.connect(self.on_item_clicked)
-        layout.addWidget(self.tree)
-        
-        # Populate tree
-        self.populate_tree()
-        
-        # Buttons
-        button_layout = QHBoxLayout()
-        save_btn = QPushButton("Execute Actions")
-        save_btn.clicked.connect(self.execute_actions)
-        button_layout.addWidget(save_btn)
-        
-        cancel_btn = QPushButton("Cancel")
-        cancel_btn.clicked.connect(self.reject)
-        button_layout.addWidget(cancel_btn)
-        
-        layout.addLayout(button_layout)
-    
-    def format_duration(self, seconds):
-        return f"{int(seconds/60)}:{int(seconds%60):02d}"
-    
-    def populate_tree(self):
-        for i, group in enumerate(self.duplicate_groups):
-            group_item = QTreeWidgetItem(self.tree)
-            group_item.setText(0, f"Group {i+1} - {len(group)}x duplicates ({group.similarity:.1%} similar)")
-            group_item.setExpanded(True)
-            
-            for j, video in enumerate(group.videos):
-                video_item = QTreeWidgetItem(group_item)
-                video_item.setText(0, str(video.path))
-                video_item.setText(1, f"{video.size_mb:.1f} MB")
-                video_item.setText(2, f"{video.resolution[0]}x{video.resolution[1]}")
-                video_item.setText(3, self.format_duration(video.duration))
-                video_item.setData(0, Qt.UserRole, (i, j))  # Store group and video index
-    
-    def apply_to_all(self):
-        action = self.action_combo.currentText()
-        for i, group in enumerate(self.duplicate_groups):
-            self.apply_action_to_group(i, action)
-        self.update_tree()
-    
-    def apply_action_to_group(self, group_idx, action):
-        group = self.duplicate_groups[group_idx]
-        selected_idx = 0
-        
-        if action == "Keep largest resolution":
-            selected_idx = max(range(len(group.videos)), 
-                             key=lambda i: group.videos[i].resolution[0] * group.videos[i].resolution[1])
-        elif action == "Keep smallest file size":
-            selected_idx = min(range(len(group.videos)), 
-                             key=lambda i: group.videos[i].size)
-        elif action == "Keep newest file":
-            selected_idx = max(range(len(group.videos)), 
-                             key=lambda i: group.videos[i].path.stat().st_mtime)
-        elif action == "Keep oldest file":
-            selected_idx = min(range(len(group.videos)), 
-                             key=lambda i: group.videos[i].path.stat().st_mtime)
-        
-        self.selected_actions[group_idx] = (action, selected_idx)
-    
-    def update_tree(self):
-        for i in range(self.tree.topLevelItemCount()):
-            group_item = self.tree.topLevelItem(i)
-            if i in self.selected_actions:
-                action, selected_idx = self.selected_actions[i]
-                for j in range(group_item.childCount()):
-                    child = group_item.child(j)
-                    if j == selected_idx:
-                        child.setText(4, "Keep")
-                        child.setForeground(4, Qt.green)
-                    else:
-                        child.setText(4, "Delete")
-                        child.setForeground(4, Qt.red)
-    
-    def on_item_clicked(self, item, column):
-        data = item.data(0, Qt.UserRole)
-        if data:  # If this is a video item
-            group_idx, video_idx = data
-            if group_idx in self.selected_actions:
-                # Toggle selection
-                _, current_selected = self.selected_actions[group_idx]
-                if current_selected == video_idx:
-                    del self.selected_actions[group_idx]
-                else:
-                    self.selected_actions[group_idx] = ("Manual selection", video_idx)
-            else:
-                self.selected_actions[group_idx] = ("Manual selection", video_idx)
-            self.update_tree()
-    
-    def execute_actions(self):
-        if not self.selected_actions:
-            QMessageBox.warning(self, "No Actions", "No actions selected!")
-            return
-        
-        # Create backup folder
-        backup_dir = Path("video_duplicates_backup") / datetime.now().strftime("%Y%m%d_%H%M%S")
-        backup_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Execute actions
-        total_saved = 0
-        for group_idx, (action, selected_idx) in self.selected_actions.items():
-            group = self.duplicate_groups[group_idx]
-            for i, video in enumerate(group.videos):
-                if i != selected_idx:
-                    # Move to backup instead of deleting
-                    backup_path = backup_dir / video.path.name
-                    if backup_path.exists():
-                        backup_path = backup_dir / f"{video.path.stem}_duplicate{video.path.suffix}"
-                    shutil.move(str(video.path), str(backup_path))
-                    total_saved += video.size
-        
-        QMessageBox.information(self, "Success", 
-            f"Actions executed successfully!\n"
-            f"Saved {total_saved / (1024*1024*1024):.1f} GB\n"
-            f"Files backed up to: {backup_dir}")
-        self.accept()
 
 class VideoHasher:
     def __init__(self, video_path, num_frames=10):
@@ -362,7 +211,7 @@ class DuplicateFinder(QThread):
         for i, video in enumerate(videos):
             self.stage_progress.emit("Analyzing Videos", i + 1, total_videos)
             
-            self.log_message.emit(f"Analyzing [{i+1}/{total_videos}] {video.name}")
+            self.log_message.emit(f"Analyzing [{i+1}/{total_videos}] {video}")
             
             hasher = VideoHasher(video, self.num_frames)
             if not hasher.info.duration:
@@ -376,7 +225,7 @@ class DuplicateFinder(QThread):
             duration_key = round(duration * 10) / 10
             self.log_message.emit(f"Duration: {duration:.1f}s, FPS: {fps:.1f}")
             
-            # Only group by duration, with very tight tolerance (±0.5 seconds)
+            # Only group by duration, with very tight tolerance (0.5 seconds)
             for d in [duration_key - 0.5, duration_key, duration_key + 0.5]:
                 d = round(d * 10) / 10  # Keep 0.1s precision
                 if d in duration_groups:
@@ -431,20 +280,27 @@ class DuplicateFinder(QThread):
         self.log_message.emit(f"\nPotential comparisons after filtering: {total_comparisons}")
         self.progress_max.emit(total_comparisons)
         
-        # Compare videos within duration groups
+        # Track which videos have been assigned to groups
+        videos_in_groups = set()
         duplicate_groups = []
         comparison_count = 0
         
+        # Compare videos within duration groups
         for duration, videos in duration_groups.items():
-            group_duplicates = []
             for i, video1 in enumerate(videos):
-                duplicates_with_first = [(video1, 1.0)]  # Video is duplicate with itself
+                if video1 in videos_in_groups:
+                    continue
+                    
+                current_group_videos = []
+                current_group_similarities = []
                 
                 for j in range(i + 1, len(videos)):
                     video2 = videos[j]
+                    if video2 in videos_in_groups:
+                        continue
+                        
                     comparison_count += 1
-                    
-                    if comparison_count % 10 == 0:  # Update progress periodically
+                    if comparison_count % 10 == 0:
                         self.progress.emit(f"Comparing videos {comparison_count}/{total_comparisons}")
                         self.progress_value.emit(comparison_count)
                     
@@ -460,27 +316,281 @@ class DuplicateFinder(QThread):
                         similarity = self.compute_similarity(sig1, sig2)
                         
                         if similarity >= self.similarity_threshold:
-                            duplicates_with_first.append((video2, similarity))
+                            current_group_videos.append(video2)
+                            current_group_similarities.append(similarity)
                             self.log_message.emit(
-                                f"\nMatch found between:\n{video1.name}\n{video2.name}\n"
+                                f"\nMatch found between:\n{video1}\n{video2}\n"
                                 f"Similarity: {similarity:.2%}")
                 
-                if len(duplicates_with_first) > 1:  # If we found any duplicates
-                    videos_info = [VideoInfo(v) for v, _ in duplicates_with_first]
-                    avg_similarity = sum(s for _, s in duplicates_with_first[1:]) / (len(duplicates_with_first) - 1)
-                    group_duplicates.append(DuplicateGroup(videos_info, avg_similarity))
-            
-            # Add non-overlapping groups
-            while group_duplicates:
-                group = group_duplicates.pop(0)
-                duplicate_groups.append(group)
-                # Remove any groups that share videos with this group
-                group_duplicates = [g for g in group_duplicates 
-                                  if not any(v.path in (x.path for x in group.videos) 
-                                           for v in g.videos)]
+                # If we found any duplicates, create a group
+                if current_group_videos:
+                    # Add the first video to the group
+                    current_group_videos.insert(0, video1)
+                    current_group_similarities.insert(0, 1.0)
+                    
+                    # Mark all videos in this group as processed
+                    videos_in_groups.update(current_group_videos)
+                    
+                    # Create group with VideoInfo objects
+                    videos_info = [VideoInfo(v) for v in current_group_videos]
+                    avg_similarity = sum(current_group_similarities) / len(current_group_similarities)
+                    duplicate_groups.append(DuplicateGroup(videos_info, avg_similarity))
         
         self.progress.emit("Finished scanning!")
+        self.log_message.emit(f"\nFound {len(duplicate_groups)} duplicate groups")
+        for i, group in enumerate(duplicate_groups):
+            self.log_message.emit(f"\nGroup {i+1} ({group.similarity:.1%} similar):")
+            for video in group.videos:
+                self.log_message.emit(f"- {video.path}")
+        
         self.finished.emit(duplicate_groups)
+
+class DuplicateManager(QDialog):
+    def __init__(self, duplicate_groups, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Duplicate Manager")
+        self.setMinimumSize(1000, 600)
+        self.duplicate_groups = duplicate_groups
+        self.file_actions = {}  # path -> action ("keep", "delete", "skip")
+        self.action_log = []
+        
+        layout = QVBoxLayout(self)
+        
+        # Action selection
+        action_layout = QHBoxLayout()
+        self.action_combo = QComboBox()
+        self.action_combo.addItems([
+            "Keep both files",
+            "Keep largest resolution",
+            "Keep smallest file size",
+            "Keep newest file",
+            "Keep oldest file",
+            "Manual selection"
+        ])
+        action_layout.addWidget(QLabel("Default Action:"))
+        action_layout.addWidget(self.action_combo)
+        
+        # Apply to all button
+        self.apply_all_btn = QPushButton("Apply to All Groups")
+        self.apply_all_btn.clicked.connect(self.apply_to_all)
+        action_layout.addWidget(self.apply_all_btn)
+        action_layout.addStretch()
+        
+        layout.addLayout(action_layout)
+        
+        # Click instructions
+        layout.addWidget(QLabel("Click on individual files to cycle through: Skip → Keep → Delete"))
+        
+        # Tree widget for duplicates
+        self.tree = QTreeWidget()
+        self.tree.setHeaderLabels(["File", "Size", "Resolution", "Duration", "Modified Date", "Action"])
+        self.tree.setColumnWidth(0, 500)
+        self.tree.itemClicked.connect(self.on_item_clicked)
+        layout.addWidget(self.tree)
+        
+        # Populate tree
+        self.populate_tree()
+        
+        # Add log viewer
+        layout.addWidget(QLabel("Action Log:"))
+        self.log_viewer = QTextEdit()
+        self.log_viewer.setReadOnly(True)
+        self.log_viewer.setMaximumHeight(100)
+        layout.addWidget(self.log_viewer)
+        
+        # Buttons
+        button_layout = QHBoxLayout()
+        save_btn = QPushButton("Execute Actions")
+        save_btn.clicked.connect(self.execute_actions)
+        button_layout.addWidget(save_btn)
+        
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        button_layout.addWidget(cancel_btn)
+        
+        layout.addLayout(button_layout)
+    
+    def apply_to_all(self):
+        action = self.action_combo.currentText()
+        self.log_action(f"Applying '{action}' to all groups")
+        
+        for i, group in enumerate(self.duplicate_groups):
+            if action == "Keep both files":
+                # Set all files in group to Keep
+                for video in group.videos:
+                    path = str(video.path)
+                    self.file_actions[path] = "Keep"
+            else:
+                selected_idx = self.get_selected_index(group, action)
+                # Set selected file to Keep, others to Delete
+                for j, video in enumerate(group.videos):
+                    path = str(video.path)
+                    self.file_actions[path] = "Keep" if j == selected_idx else "Delete"
+        
+        self.update_tree()
+    
+    def get_selected_index(self, group, action):
+        """Determine which file to keep based on the selected action."""
+        if action == "Keep largest resolution":
+            return max(range(len(group.videos)), 
+                      key=lambda i: group.videos[i].resolution[0] * group.videos[i].resolution[1])
+        elif action == "Keep smallest file size":
+            return min(range(len(group.videos)), 
+                      key=lambda i: group.videos[i].size)
+        elif action == "Keep newest file":
+            return max(range(len(group.videos)), 
+                      key=lambda i: group.videos[i].path.stat().st_mtime)
+        elif action == "Keep oldest file":
+            return min(range(len(group.videos)), 
+                      key=lambda i: group.videos[i].path.stat().st_mtime)
+        return 0  # Default to first file for manual selection
+
+    def log_action(self, message):
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        log_entry = f"[{timestamp}] {message}"
+        self.action_log.append(log_entry)
+        self.log_viewer.append(log_entry)
+    
+    def format_duration(self, seconds):
+        return f"{int(seconds/60)}:{int(seconds%60):02d}"
+    
+    def populate_tree(self):
+        for i, group in enumerate(self.duplicate_groups):
+            group_item = QTreeWidgetItem(self.tree)
+            group_item.setText(0, f"Group {i+1} - {len(group)}x duplicates ({group.similarity:.1%} similar)")
+            group_item.setExpanded(True)
+            
+            for j, video in enumerate(group.videos):
+                video_item = QTreeWidgetItem(group_item)
+                video_item.setText(0, str(video.path))
+                video_item.setText(1, f"{video.size_mb:.1f} MB")
+                video_item.setText(2, f"{video.resolution[0]}x{video.resolution[1]}")
+                video_item.setText(3, self.format_duration(video.duration))
+                mtime = datetime.fromtimestamp(video.path.stat().st_mtime)
+                video_item.setText(4, mtime.strftime("%Y-%m-%d %H:%M:%S"))
+                video_item.setText(5, "Keep")  # Default action
+                video_item.setForeground(5, Qt.green)
+                video_item.setData(0, Qt.UserRole, str(video.path))
+    
+    def cycle_action(self, item):
+        """Toggle between Keep and Delete"""
+        current_action = item.text(5)
+        path = item.data(0, Qt.UserRole)
+        
+        if current_action == "Delete":
+            new_action = "Keep"
+            color = Qt.green
+        else:  # Keep or empty
+            new_action = "Delete"
+            color = Qt.red
+            
+        item.setText(5, new_action)
+        item.setForeground(5, color)
+        self.file_actions[path] = new_action
+        self.log_action(f"Set action for {Path(path).name}: {new_action}")
+    
+    def on_item_clicked(self, item, column):
+        path = item.data(0, Qt.UserRole)
+        if path:  # If this is a video item
+            self.cycle_action(item)
+    
+    def update_tree(self):
+        """Update the tree to reflect current file actions"""
+        for i in range(self.tree.topLevelItemCount()):
+            group_item = self.tree.topLevelItem(i)
+            for j in range(group_item.childCount()):
+                child = group_item.child(j)
+                path = child.data(0, Qt.UserRole)
+                if path in self.file_actions:
+                    action = self.file_actions[path]
+                    child.setText(5, action)
+                    if action == "Keep":
+                        child.setForeground(5, Qt.green)
+                    elif action == "Delete":
+                        child.setForeground(5, Qt.red)
+                    else:  # Skip
+                        child.setForeground(5, Qt.gray)
+    
+    def execute_actions(self):
+        actions_to_execute = {path: action for path, action in self.file_actions.items() 
+                            if action == "Delete"}  # Only process Delete actions
+        
+        if not actions_to_execute:
+            response = QMessageBox.question(
+                self, "No Actions", 
+                "No files selected for deletion. Continue?",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            if response == QMessageBox.No:
+                return
+        
+        # Create backup folder
+        backup_dir = Path("video_duplicates_backup") / datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Save action log
+        log_file = backup_dir / "action_log.txt"
+        with open(log_file, 'w', encoding='utf-8') as f:
+            f.write("Video Duplicate Manager - Action Log\n")
+            f.write("=" * 50 + "\n\n")
+            f.write("\n".join(self.action_log))
+            f.write("\n\nExecuted Actions:\n")
+            f.write("=" * 50 + "\n\n")
+        
+        # Execute actions
+        total_saved = 0
+        files_moved = 0
+        errors = []
+        
+        with open(log_file, 'a', encoding='utf-8') as f:
+            # Group files by their groups for better logging
+            for i, group in enumerate(self.duplicate_groups):
+                f.write(f"\nGroup {i+1}:\n")
+                group_files = [str(v.path) for v in group.videos]
+                
+                for path_str in group_files:
+                    action = self.file_actions.get(path_str, "Keep")
+                    path = Path(path_str)
+                    
+                    if action == "Delete":
+                        try:
+                            # Get file size before moving
+                            file_size = path.stat().st_size
+                            
+                            backup_path = backup_dir / path.name
+                            if backup_path.exists():
+                                backup_path = backup_dir / f"{path.stem}_duplicate{path.suffix}"
+                                
+                            try:
+                                shutil.move(str(path), str(backup_path))
+                                total_saved += file_size
+                                files_moved += 1
+                                f.write(f"Moved to backup: {path}\n")
+                            except Exception as e:
+                                errors.append(f"Error moving {path}: {str(e)}")
+                                f.write(f"ERROR moving {path}: {str(e)}\n")
+                        except Exception as e:
+                            errors.append(f"Error processing {path}: {str(e)}")
+                            f.write(f"ERROR processing {path}: {str(e)}\n")
+                    elif action == "Keep":
+                        f.write(f"Kept: {path}\n")
+        
+        # Show results with any errors
+        result_message = (
+            f"Actions executed!\n"
+            f"Files moved to backup: {files_moved}\n"
+            f"Space saved: {total_saved / (1024*1024*1024):.1f} GB\n"
+            f"Files backed up to: {backup_dir}\n"
+            f"Log file: {log_file}"
+        )
+        
+        if errors:
+            result_message += "\n\nErrors occurred:\n" + "\n".join(errors)
+            QMessageBox.warning(self, "Completed with Errors", result_message)
+        else:
+            QMessageBox.information(self, "Success", result_message)
+            
+        self.accept()
 
 class MainWindow(QMainWindow):
     def __init__(self):
