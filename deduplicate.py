@@ -155,7 +155,7 @@ class DuplicateFinder(QThread):
         return sum(similarities) / len(similarities) if similarities else 0.0
     
     def get_video_groups(self, videos):
-        """Group videos by duration to reduce comparison space."""
+        """Group videos primarily by duration with flexible size matching."""
         duration_groups = {}
         hashers = {}
         
@@ -164,7 +164,12 @@ class DuplicateFinder(QThread):
         for i, video in enumerate(videos):
             self.stage_progress.emit("Analyzing Videos", i + 1, total_videos)
             
-            size_mb = Path(video).stat().st_size / (1024 * 1024)
+            try:
+                size_mb = Path(video).stat().st_size / (1024 * 1024)
+            except Exception:
+                self.log_message.emit(f"⚠️ Could not read file size for {video.name}")
+                continue
+            
             self.log_message.emit(f"Analyzing [{i+1}/{total_videos}] {video.name} ({size_mb:.1f}MB)")
             
             hasher = VideoHasher(video, self.num_frames)
@@ -173,19 +178,106 @@ class DuplicateFinder(QThread):
                 self.log_message.emit(f"⚠️ Could not read video information")
                 continue
                 
-            duration = round(info['duration'])
+            duration = info['duration']
             fps = info['fps']
-            self.log_message.emit(f"Duration: {duration}s, FPS: {fps:.1f}")
             
-            # Group videos with similar durations (±2 seconds)
-            for d in range(duration - 2, duration + 3):
+            # Round duration to nearest 0.1 second for more precise grouping
+            duration_key = round(duration * 10) / 10
+            self.log_message.emit(f"Duration: {duration:.1f}s, FPS: {fps:.1f}")
+            
+            # Only group by duration, with very tight tolerance (±0.5 seconds)
+            for d in [duration_key - 0.5, duration_key, duration_key + 0.5]:
+                d = round(d * 10) / 10  # Keep 0.1s precision
                 if d in duration_groups:
+                    # Log size difference if it's notable but still include in group
+                    existing_sizes = [Path(v).stat().st_size / (1024 * 1024) for v in duration_groups[d]]
+                    avg_size = sum(existing_sizes) / len(existing_sizes)
+                    if abs(size_mb - avg_size) > 50:  # If size differs by more than 50MB
+                        self.log_message.emit(f"Note: Large size difference in group ({size_mb:.1f}MB vs avg {avg_size:.1f}MB)")
                     duration_groups[d].append(video)
                 else:
                     duration_groups[d] = [video]
-            hashers[video] = hasher
             
+            hashers[video] = hasher
+        
+        # Log grouping statistics
+        total_groups = len(duration_groups)
+        avg_group_size = sum(len(g) for g in duration_groups.values()) / total_groups if total_groups > 0 else 0
+        large_groups = sum(1 for g in duration_groups.values() if len(g) > 10)
+        
+        self.log_message.emit(f"\nFormed {total_groups} duration-based groups")
+        self.log_message.emit(f"Average group size: {avg_group_size:.1f} videos")
+        self.log_message.emit(f"Groups with >10 videos: {large_groups}")
+        
+        # Log largest groups for inspection
+        sorted_groups = sorted(duration_groups.items(), key=lambda x: len(x[1]), reverse=True)
+        if sorted_groups:
+            self.log_message.emit("\nLargest groups by duration:")
+            for duration, group in sorted_groups[:5]:
+                self.log_message.emit(f"{duration:.1f}s: {len(group)} videos")
+        
         return duration_groups, hashers
+        
+        return groups, hashers
+
+    def run(self):
+        # Collect all video files
+        all_videos = []
+        scan_count = 0
+        for path in self.paths:
+            videos = self.get_video_files(path)
+            scan_count += 1
+            self.progress.emit(f"Scanning path {scan_count}/{len(self.paths)}")
+            all_videos.extend(videos)
+            self.log_message.emit(f"Found {len(videos)} videos in {path}")
+        
+        all_videos = list(set(all_videos))  # Remove duplicates
+        total_size_mb = sum(Path(v).stat().st_size for v in all_videos) / (1024 * 1024)
+        self.log_message.emit(f"\nTotal unique videos found: {len(all_videos)}")
+        self.log_message.emit(f"Total size: {total_size_mb:.1f}MB")
+        
+        # Pre-filter videos by duration and size
+        groups, hashers = self.get_video_groups(all_videos)
+        
+        # Count potential comparisons after grouping
+        total_comparisons = 0
+        for videos in groups.values():
+            n = len(videos)
+            total_comparisons += (n * (n - 1)) // 2
+            
+        self.log_message.emit(f"\nPotential comparisons after filtering: {total_comparisons}")
+        self.progress_max.emit(total_comparisons)
+        
+        # Compare videos within groups
+        duplicates = []
+        comparison_count = 0
+        
+        # Compare only within same groups
+        for group_key, videos in groups.items():
+            duration, size = group_key
+            for i, video1 in enumerate(videos):
+                for j in range(i + 1, len(videos)):
+                    video2 = videos[j]
+                    comparison_count += 1
+                    
+                    if comparison_count % 100 == 0:  # Update progress less frequently
+                        self.progress.emit(f"Comparing videos {comparison_count}/{total_comparisons}")
+                        self.progress_value.emit(comparison_count)
+                    
+                    # Use cached hashers
+                    hasher1 = hashers[video1]
+                    hasher2 = hashers[video2]
+                    
+                    # Get cached signatures
+                    sig1 = hasher1.signature
+                    sig2 = hasher2.signature
+                    
+                    if sig1 and sig2:
+                        similarity = self.compute_similarity(sig1, sig2)
+                        
+                        if similarity >= self.similarity_threshold:
+                            self.log_message.emit(f"\nMatch found between:\n{video1}\n{video2}\nSimilarity: {similarity:.2%}")
+                            duplicates.append((str(video1), str(video2), similarity))
     
     def run(self):
         # Collect all video files
