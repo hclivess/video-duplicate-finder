@@ -1,14 +1,76 @@
+#!/usr/bin/env python3
 import sys
 import os
 from pathlib import Path
 import cv2
 import numpy as np
+import shutil
+from datetime import datetime
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                             QHBoxLayout, QPushButton, QLabel, QFileDialog, 
                             QTextEdit, QListWidget, QCheckBox, QSpinBox,
-                            QStyle, QProgressBar)
-from PyQt5.QtCore import Qt, QThread, pyqtSignal
-from PyQt5.QtGui import QDragEnterEvent, QDropEvent
+                            QStyle, QProgressBar, QDialog, QTreeWidget, 
+                            QTreeWidgetItem, QMenu, QAction, QMessageBox,
+                            QInputDialog, QComboBox)
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize
+from PyQt5.QtGui import QDragEnterEvent, QDropEvent, QIcon
+
+class VideoInfo:
+    def __init__(self, path):
+        self.path = Path(path)
+        self.size = self.path.stat().st_size
+        self.size_mb = self.size / (1024 * 1024)
+        self._duration = None
+        self._fps = None
+        self._resolution = None
+
+    @property
+    def duration(self):
+        if self._duration is None:
+            self._read_video_info()
+        return self._duration
+
+    @property
+    def fps(self):
+        if self._fps is None:
+            self._read_video_info()
+        return self._fps
+
+    @property
+    def resolution(self):
+        if self._resolution is None:
+            self._read_video_info()
+        return self._resolution
+
+    def _read_video_info(self):
+        cap = cv2.VideoCapture(str(self.path))
+        if not cap.isOpened():
+            self._duration = 0
+            self._fps = 0
+            self._resolution = (0, 0)
+            return
+
+        self._fps = cap.get(cv2.CAP_PROP_FPS)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        self._duration = total_frames / self._fps if self._fps > 0 else 0
+        self._resolution = (
+            int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+            int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        )
+        cap.release()
+
+class DuplicateGroup:
+    def __init__(self, videos, similarity):
+        self.videos = videos  # List of VideoInfo objects
+        self.similarity = similarity
+        self.selected_for_action = None  # Index of video selected for keeping
+
+    @property
+    def total_size(self):
+        return sum(v.size for v in self.videos)
+
+    def __len__(self):
+        return len(self.videos)
 
 class DragDropList(QListWidget):
     paths_changed = pyqtSignal()
@@ -45,40 +107,176 @@ class DragDropList(QListWidget):
         if added:
             self.paths_changed.emit()
 
+class DuplicateManager(QDialog):
+    def __init__(self, duplicate_groups, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Duplicate Manager")
+        self.setMinimumSize(1000, 600)
+        self.duplicate_groups = duplicate_groups
+        self.selected_actions = {}  # group_index -> (action, selected_index)
+        
+        layout = QVBoxLayout(self)
+        
+        # Action selection
+        action_layout = QHBoxLayout()
+        self.action_combo = QComboBox()
+        self.action_combo.addItems([
+            "Keep largest resolution",
+            "Keep smallest file size",
+            "Keep newest file",
+            "Keep oldest file",
+            "Manual selection"
+        ])
+        action_layout.addWidget(QLabel("Default Action:"))
+        action_layout.addWidget(self.action_combo)
+        
+        # Apply to all button
+        self.apply_all_btn = QPushButton("Apply to All Groups")
+        self.apply_all_btn.clicked.connect(self.apply_to_all)
+        action_layout.addWidget(self.apply_all_btn)
+        action_layout.addStretch()
+        
+        layout.addLayout(action_layout)
+        
+        # Tree widget for duplicates
+        self.tree = QTreeWidget()
+        self.tree.setHeaderLabels(["File", "Size", "Resolution", "Duration", "Action"])
+        self.tree.setColumnWidth(0, 400)
+        self.tree.itemClicked.connect(self.on_item_clicked)
+        layout.addWidget(self.tree)
+        
+        # Populate tree
+        self.populate_tree()
+        
+        # Buttons
+        button_layout = QHBoxLayout()
+        save_btn = QPushButton("Execute Actions")
+        save_btn.clicked.connect(self.execute_actions)
+        button_layout.addWidget(save_btn)
+        
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        button_layout.addWidget(cancel_btn)
+        
+        layout.addLayout(button_layout)
+    
+    def format_duration(self, seconds):
+        return f"{int(seconds/60)}:{int(seconds%60):02d}"
+    
+    def populate_tree(self):
+        for i, group in enumerate(self.duplicate_groups):
+            group_item = QTreeWidgetItem(self.tree)
+            group_item.setText(0, f"Group {i+1} - {len(group)}x duplicates ({group.similarity:.1%} similar)")
+            group_item.setExpanded(True)
+            
+            for j, video in enumerate(group.videos):
+                video_item = QTreeWidgetItem(group_item)
+                video_item.setText(0, str(video.path))
+                video_item.setText(1, f"{video.size_mb:.1f} MB")
+                video_item.setText(2, f"{video.resolution[0]}x{video.resolution[1]}")
+                video_item.setText(3, self.format_duration(video.duration))
+                video_item.setData(0, Qt.UserRole, (i, j))  # Store group and video index
+    
+    def apply_to_all(self):
+        action = self.action_combo.currentText()
+        for i, group in enumerate(self.duplicate_groups):
+            self.apply_action_to_group(i, action)
+        self.update_tree()
+    
+    def apply_action_to_group(self, group_idx, action):
+        group = self.duplicate_groups[group_idx]
+        selected_idx = 0
+        
+        if action == "Keep largest resolution":
+            selected_idx = max(range(len(group.videos)), 
+                             key=lambda i: group.videos[i].resolution[0] * group.videos[i].resolution[1])
+        elif action == "Keep smallest file size":
+            selected_idx = min(range(len(group.videos)), 
+                             key=lambda i: group.videos[i].size)
+        elif action == "Keep newest file":
+            selected_idx = max(range(len(group.videos)), 
+                             key=lambda i: group.videos[i].path.stat().st_mtime)
+        elif action == "Keep oldest file":
+            selected_idx = min(range(len(group.videos)), 
+                             key=lambda i: group.videos[i].path.stat().st_mtime)
+        
+        self.selected_actions[group_idx] = (action, selected_idx)
+    
+    def update_tree(self):
+        for i in range(self.tree.topLevelItemCount()):
+            group_item = self.tree.topLevelItem(i)
+            if i in self.selected_actions:
+                action, selected_idx = self.selected_actions[i]
+                for j in range(group_item.childCount()):
+                    child = group_item.child(j)
+                    if j == selected_idx:
+                        child.setText(4, "Keep")
+                        child.setForeground(4, Qt.green)
+                    else:
+                        child.setText(4, "Delete")
+                        child.setForeground(4, Qt.red)
+    
+    def on_item_clicked(self, item, column):
+        data = item.data(0, Qt.UserRole)
+        if data:  # If this is a video item
+            group_idx, video_idx = data
+            if group_idx in self.selected_actions:
+                # Toggle selection
+                _, current_selected = self.selected_actions[group_idx]
+                if current_selected == video_idx:
+                    del self.selected_actions[group_idx]
+                else:
+                    self.selected_actions[group_idx] = ("Manual selection", video_idx)
+            else:
+                self.selected_actions[group_idx] = ("Manual selection", video_idx)
+            self.update_tree()
+    
+    def execute_actions(self):
+        if not self.selected_actions:
+            QMessageBox.warning(self, "No Actions", "No actions selected!")
+            return
+        
+        # Create backup folder
+        backup_dir = Path("video_duplicates_backup") / datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Execute actions
+        total_saved = 0
+        for group_idx, (action, selected_idx) in self.selected_actions.items():
+            group = self.duplicate_groups[group_idx]
+            for i, video in enumerate(group.videos):
+                if i != selected_idx:
+                    # Move to backup instead of deleting
+                    backup_path = backup_dir / video.path.name
+                    if backup_path.exists():
+                        backup_path = backup_dir / f"{video.path.stem}_duplicate{video.path.suffix}"
+                    shutil.move(str(video.path), str(backup_path))
+                    total_saved += video.size
+        
+        QMessageBox.information(self, "Success", 
+            f"Actions executed successfully!\n"
+            f"Saved {total_saved / (1024*1024*1024):.1f} GB\n"
+            f"Files backed up to: {backup_dir}")
+        self.accept()
+
 class VideoHasher:
     def __init__(self, video_path, num_frames=10):
         self.video_path = str(video_path)
         self.num_frames = num_frames
-        self._video_info = None
+        self._info = None
         self._signature = None
         
     @property
-    def video_info(self):
-        if self._video_info is None:
-            self._video_info = self.get_video_info()
-        return self._video_info
-        
+    def info(self):
+        if self._info is None:
+            self._info = VideoInfo(self.video_path)
+        return self._info
+    
     @property
     def signature(self):
         if self._signature is None:
             self._signature = self.get_video_signature()
         return self._signature
-    
-    def get_video_info(self):
-        cap = cv2.VideoCapture(self.video_path)
-        if not cap.isOpened():
-            return None
-        
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        duration = total_frames / fps if fps > 0 else 0
-        cap.release()
-        
-        return {
-            'total_frames': total_frames,
-            'fps': fps,
-            'duration': duration
-        }
     
     def compute_frame_hash(self, frame):
         small_frame = cv2.resize(frame, (32, 32))
@@ -91,12 +289,12 @@ class VideoHasher:
         if not cap.isOpened():
             return None
             
-        info = self.get_video_info()
-        if not info or info['total_frames'] <= 0:
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if total_frames <= 0:
             cap.release()
             return None
         
-        frame_indices = np.linspace(0, info['total_frames']-1, self.num_frames, dtype=int)
+        frame_indices = np.linspace(0, total_frames-1, self.num_frames, dtype=int)
         frame_hashes = []
         
         for frame_idx in frame_indices:
@@ -113,8 +311,8 @@ class DuplicateFinder(QThread):
     progress_value = pyqtSignal(int)
     progress_max = pyqtSignal(int)
     log_message = pyqtSignal(str)
-    stage_progress = pyqtSignal(str, int, int)  # stage name, current, total
-    finished = pyqtSignal(list)
+    stage_progress = pyqtSignal(str, int, int)
+    finished = pyqtSignal(list)  # List of DuplicateGroup objects
     
     def __init__(self, paths, recursive=True, similarity_threshold=0.9, num_frames=10):
         super().__init__()
@@ -164,22 +362,15 @@ class DuplicateFinder(QThread):
         for i, video in enumerate(videos):
             self.stage_progress.emit("Analyzing Videos", i + 1, total_videos)
             
-            try:
-                size_mb = Path(video).stat().st_size / (1024 * 1024)
-            except Exception:
-                self.log_message.emit(f"⚠️ Could not read file size for {video.name}")
-                continue
-            
-            self.log_message.emit(f"Analyzing [{i+1}/{total_videos}] {video.name} ({size_mb:.1f}MB)")
+            self.log_message.emit(f"Analyzing [{i+1}/{total_videos}] {video.name}")
             
             hasher = VideoHasher(video, self.num_frames)
-            info = hasher.video_info
-            if not info:
+            if not hasher.info.duration:
                 self.log_message.emit(f"⚠️ Could not read video information")
                 continue
                 
-            duration = info['duration']
-            fps = info['fps']
+            duration = hasher.info.duration
+            fps = hasher.info.fps
             
             # Round duration to nearest 0.1 second for more precise grouping
             duration_key = round(duration * 10) / 10
@@ -189,11 +380,6 @@ class DuplicateFinder(QThread):
             for d in [duration_key - 0.5, duration_key, duration_key + 0.5]:
                 d = round(d * 10) / 10  # Keep 0.1s precision
                 if d in duration_groups:
-                    # Log size difference if it's notable but still include in group
-                    existing_sizes = [Path(v).stat().st_size / (1024 * 1024) for v in duration_groups[d]]
-                    avg_size = sum(existing_sizes) / len(existing_sizes)
-                    if abs(size_mb - avg_size) > 50:  # If size differs by more than 50MB
-                        self.log_message.emit(f"Note: Large size difference in group ({size_mb:.1f}MB vs avg {avg_size:.1f}MB)")
                     duration_groups[d].append(video)
                 else:
                     duration_groups[d] = [video]
@@ -209,17 +395,8 @@ class DuplicateFinder(QThread):
         self.log_message.emit(f"Average group size: {avg_group_size:.1f} videos")
         self.log_message.emit(f"Groups with >10 videos: {large_groups}")
         
-        # Log largest groups for inspection
-        sorted_groups = sorted(duration_groups.items(), key=lambda x: len(x[1]), reverse=True)
-        if sorted_groups:
-            self.log_message.emit("\nLargest groups by duration:")
-            for duration, group in sorted_groups[:5]:
-                self.log_message.emit(f"{duration:.1f}s: {len(group)} videos")
-        
         return duration_groups, hashers
-        
-        return groups, hashers
-
+    
     def run(self):
         # Collect all video files
         all_videos = []
@@ -232,35 +409,42 @@ class DuplicateFinder(QThread):
             self.log_message.emit(f"Found {len(videos)} videos in {path}")
         
         all_videos = list(set(all_videos))  # Remove duplicates
+        
+        if not all_videos:
+            self.log_message.emit("No videos found!")
+            self.finished.emit([])
+            return
+            
         total_size_mb = sum(Path(v).stat().st_size for v in all_videos) / (1024 * 1024)
         self.log_message.emit(f"\nTotal unique videos found: {len(all_videos)}")
         self.log_message.emit(f"Total size: {total_size_mb:.1f}MB")
         
-        # Pre-filter videos by duration and size
-        groups, hashers = self.get_video_groups(all_videos)
+        # Pre-filter videos by duration
+        duration_groups, hashers = self.get_video_groups(all_videos)
         
         # Count potential comparisons after grouping
         total_comparisons = 0
-        for videos in groups.values():
+        for videos in duration_groups.values():
             n = len(videos)
             total_comparisons += (n * (n - 1)) // 2
             
         self.log_message.emit(f"\nPotential comparisons after filtering: {total_comparisons}")
         self.progress_max.emit(total_comparisons)
         
-        # Compare videos within groups
-        duplicates = []
+        # Compare videos within duration groups
+        duplicate_groups = []
         comparison_count = 0
         
-        # Compare only within same groups
-        for group_key, videos in groups.items():
-            duration, size = group_key
+        for duration, videos in duration_groups.items():
+            group_duplicates = []
             for i, video1 in enumerate(videos):
+                duplicates_with_first = [(video1, 1.0)]  # Video is duplicate with itself
+                
                 for j in range(i + 1, len(videos)):
                     video2 = videos[j]
                     comparison_count += 1
                     
-                    if comparison_count % 100 == 0:  # Update progress less frequently
+                    if comparison_count % 10 == 0:  # Update progress periodically
                         self.progress.emit(f"Comparing videos {comparison_count}/{total_comparisons}")
                         self.progress_value.emit(comparison_count)
                     
@@ -276,77 +460,27 @@ class DuplicateFinder(QThread):
                         similarity = self.compute_similarity(sig1, sig2)
                         
                         if similarity >= self.similarity_threshold:
-                            self.log_message.emit(f"\nMatch found between:\n{video1}\n{video2}\nSimilarity: {similarity:.2%}")
-                            duplicates.append((str(video1), str(video2), similarity))
-    
-    def run(self):
-        # Collect all video files
-        all_videos = []
-        scan_count = 0
-        for path in self.paths:
-            videos = self.get_video_files(path)
-            scan_count += 1
-            self.progress.emit(f"Scanning path {scan_count}/{len(self.paths)}")
-            all_videos.extend(videos)
-            self.log_message.emit(f"Found {len(videos)} videos in {path}")
-        
-        all_videos = list(set(all_videos))  # Remove duplicates
-        total_size_mb = sum(Path(v).stat().st_size for v in all_videos) / (1024 * 1024)
-        self.log_message.emit(f"\nTotal unique videos found: {len(all_videos)}")
-        self.log_message.emit(f"Total size: {total_size_mb:.1f}MB")
-        
-        # Pre-filter videos by duration
-        duration_groups, hashers = self.get_video_groups(all_videos)
-        
-        # Count potential comparisons after grouping
-        total_comparisons = 0
-        for videos in duration_groups.values():
-            n = len(videos)
-            total_comparisons += (n * (n - 1)) // 2
+                            duplicates_with_first.append((video2, similarity))
+                            self.log_message.emit(
+                                f"\nMatch found between:\n{video1.name}\n{video2.name}\n"
+                                f"Similarity: {similarity:.2%}")
+                
+                if len(duplicates_with_first) > 1:  # If we found any duplicates
+                    videos_info = [VideoInfo(v) for v, _ in duplicates_with_first]
+                    avg_similarity = sum(s for _, s in duplicates_with_first[1:]) / (len(duplicates_with_first) - 1)
+                    group_duplicates.append(DuplicateGroup(videos_info, avg_similarity))
             
-        self.log_message.emit(f"\nPotential comparisons after duration filtering: {total_comparisons}")
-        self.progress_max.emit(total_comparisons)
-        
-        # Compare videos within duration groups
-        duplicates = []
-        comparison_count = 0
-        
-        # Compare only within duration groups
-        for duration, videos in duration_groups.items():
-            for i, video1 in enumerate(videos):
-                for j in range(i + 1, len(videos)):
-                    video2 = videos[j]
-                    comparison_count += 1
-                    self.progress.emit(f"Comparing videos {comparison_count}/{total_comparisons}")
-                    self.progress_value.emit(comparison_count)
-                    
-                    # Use cached hashers
-                    hasher1 = hashers[video1]
-                    hasher2 = hashers[video2]
-                    
-                    # Quick check of video info before full comparison
-                    info1 = hasher1.video_info
-                    info2 = hasher2.video_info
-                    
-                    if not info1 or not info2:
-                        self.log_message.emit("Error reading one or both videos")
-                        continue
-                        
-                    # Get cached signatures
-                    sig1 = hasher1.signature
-                    sig2 = hasher2.signature
-                    
-                    if sig1 and sig2:
-                        similarity = self.compute_similarity(sig1, sig2)
-                        
-                        if similarity >= self.similarity_threshold:
-                            self.log_message.emit(f"\nMatch found between:\n{video1}\n{video2}\nSimilarity: {similarity:.2%}")
-                            duplicates.append((str(video1), str(video2), similarity))
-                    else:
-                        self.log_message.emit("Error processing video signatures")
+            # Add non-overlapping groups
+            while group_duplicates:
+                group = group_duplicates.pop(0)
+                duplicate_groups.append(group)
+                # Remove any groups that share videos with this group
+                group_duplicates = [g for g in group_duplicates 
+                                  if not any(v.path in (x.path for x in group.videos) 
+                                           for v in g.videos)]
         
         self.progress.emit("Finished scanning!")
-        self.finished.emit(duplicates)
+        self.finished.emit(duplicate_groups)
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -457,20 +591,25 @@ class MainWindow(QMainWindow):
         scrollbar = self.log_area.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
 
-    def show_results(self, duplicates):
-        if not duplicates:
+    def show_results(self, duplicate_groups):
+        if not duplicate_groups:
             self.results_area.setText("No duplicate videos found.")
+            QMessageBox.information(self, "Scan Complete", "No duplicate videos found.")
         else:
-            result_text = "Duplicate videos found:\n\n"
-            duplicates.sort(key=lambda x: x[2], reverse=True)  # Sort by similarity
-            for file1, file2, similarity in duplicates:
-                # Get file sizes
-                size1 = Path(file1).stat().st_size / (1024 * 1024)  # MB
-                size2 = Path(file2).stat().st_size / (1024 * 1024)  # MB
-                result_text += f"Match ({similarity:.2%} similar):\n"
-                result_text += f"1. {file1} ({size1:.1f}MB)\n"
-                result_text += f"2. {file2} ({size2:.1f}MB)\n\n"
-            self.results_area.setText(result_text)
+            total_groups = len(duplicate_groups)
+            total_duplicates = sum(len(group.videos) - 1 for group in duplicate_groups)
+            potential_savings = sum(group.total_size - min(v.size for v in group.videos) 
+                                 for group in duplicate_groups)
+            
+            self.results_area.setText(
+                f"Found {total_groups} groups of duplicates\n"
+                f"Total duplicate files: {total_duplicates}\n"
+                f"Potential space savings: {potential_savings / (1024*1024*1024):.1f} GB\n\n"
+            )
+            
+            # Show duplicate manager
+            manager = DuplicateManager(duplicate_groups, self)
+            manager.exec_()
         
         self.start_button.setEnabled(True)
         self.progress_bar.setValue(0)
