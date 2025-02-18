@@ -1,5 +1,7 @@
 # Video Duplicate Finder
 
+![image](image.png)
+
 ## Overview
 
 Video Duplicate Finder is a powerful desktop application that helps you identify and manage duplicate video files across your computer. Using advanced video signature analysis, this tool can detect near-identical videos based on content similarity, resolution, and duration.
